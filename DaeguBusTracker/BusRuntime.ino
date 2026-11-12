@@ -6,17 +6,26 @@ constexpr uint32_t POSITION_REFRESH_MS = 60000, ETA_REFRESH_MS = 120000;
 constexpr uint32_t STALE_MS = 180000, HTTP_TIMEOUT_MS = 10000;
 constexpr uint16_t SESSION_LIMIT = 600;
 constexpr bool BUZZER_ENABLED = false; // Enable after checking buzzer voltage/current and driver.
+// The fixed option uses the official bus stop named Hwawon High School Front.
+// GPS remains the automatic default until D2 explicitly chooses this location.
+constexpr double HWAWON_LAT = 35.798252033333334;
+constexpr double HWAWON_LON = 128.48887875;
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 TinyGPSPlus gps;
-enum class Screen : uint8_t { WIFI, GPS, FIND_STOP, ROUTES, DIRECTIONS, VEHICLES, TRACK, ERROR };
-Screen screen = Screen::WIFI, resumeScreen = Screen::GPS;
+enum class Screen : uint8_t { WIFI, SOURCE, FIND_STOP, ROUTES, VARIANTS, DIRECTIONS, VEHICLES, TRACK, ERROR };
+Screen screen = Screen::WIFI, resumeScreen = Screen::SOURCE;
 char errorText[25] = "";
 uint32_t wifiAttemptMs = 0, displayMs = 0, gpsSampleMs = 0;
 uint32_t buttonChangedMs = 0, buttonDownMs = 0, nextRetryMs = 0;
 uint32_t posPollMs = 0, etaPollMs = 0, posGoodMs = 0;
 uint16_t apiCalls = 0, knob = 0;
 uint8_t gpsCount = 0, menuIndex = 0, routeCount = 0, vehicleCount = 0;
+enum class VehicleListStatus : uint8_t {
+  UNKNOWN, NO_ROUTE_BUSES, NO_DIRECTION_BUSES, NO_APPROACHING_BUSES,
+  INCOMPLETE_DATA, HAS_APPROACHING_BUSES
+};
+VehicleListStatus vehicleListStatus = VehicleListStatus::UNKNOWN;
 bool buttonRaw = HIGH, buttonStable = HIGH, longHandled = false;
 bool gpsReady = false, etaAvailable = false, buzzerPlayed = false, vehiclePresent = false;
 bool vehicleListLoaded = false;
@@ -24,7 +33,8 @@ bool apiQuotaExceeded = false;
 double gpsLat[5], gpsLon[5], latitude = 0, longitude = 0;
 uint64_t stopId = 0;
 char stopName[42] = "", stopIdText[16] = "";
-uint16_t stopIndex = 0, routeChoices[64], chosenRoute = 0;
+uint16_t stopIndex = 0, routeChoices[64], variantChoices[32], chosenRoute = 0;
+uint8_t variantCount = 0;
 char routeId[12] = "", routeNo[16] = "";
 int targetSeq[2] = {-1, -1}, startSeq[2] = {-1, -1};
 int routeSequences[2][256];
@@ -219,7 +229,7 @@ bool nearestStop() {
     stream.close(); return false;
   }
   stream.close();
-  if (!bestId) { setError("No stop within 500m", Screen::GPS); return true; }
+  if (!bestId) { setError("No stop within 500m", Screen::SOURCE); return true; }
   for (uint16_t i = 0; i < STOP_COUNT; ++i) if (STOP_IDS[i] == bestId) {
     stopIndex = i; stopId = bestId;
     copyText(stopName, bestName, sizeof(stopName));
@@ -228,6 +238,12 @@ bool nearestStop() {
     for (uint16_t r = 0; r < ROUTE_COUNT; ++r) {
       for (uint16_t n = ROUTE_OFFSETS[r]; n < ROUTE_OFFSETS[r + 1]; ++n) {
         if (ROUTE_STOPS[n] != stopIndex) continue;
+        bool numberAlreadyShown = false;
+        for (uint8_t shown = 0; shown < routeCount; ++shown)
+          if (strcmp(ROUTE_NUMBERS[r], ROUTE_NUMBERS[routeChoices[shown]]) == 0) {
+            numberAlreadyShown = true; break;
+          }
+        if (numberAlreadyShown) break;
         if (routeCount >= 64) { setError("Too many routes", Screen::FIND_STOP); return true; }
         routeChoices[routeCount++] = r;
         break;
@@ -239,7 +255,7 @@ bool nearestStop() {
     Serial.print(F(" routes=")); Serial.println(routeCount);
     return true;
   }
-  setError("Stop map out of date", Screen::GPS);
+  setError("Stop map out of date", Screen::SOURCE);
   return true;
 }
 
@@ -278,16 +294,20 @@ bool loadVehicles(bool initial) {
   if (!findArray(stream, "items")) { stream.close(); return false; }
   char object[500]; int result;
   uint8_t count = 0;
+  uint16_t routeBusCount = 0, directionBusCount = 0, incompleteBusCount = 0;
   bool foundSelected = false;
   int newSeq = selectedSeq;
   while ((result = nextObject(stream, object, sizeof(object))) == 1) {
     JsonDocument doc;
     if (deserializeJson(doc, object)) { stream.close(); return false; }
+    ++routeBusCount;
     int d = atoi(doc["moveDir"] | "-1");
     if (d != direction) continue;
+    ++directionBusCount;
     const char* id = doc["vhcNo2"] | "";
     int seq = doc["seq"] | -1;
-    if (!*id || seq < 0 || seq > targetSeq[direction]) continue;
+    if (!*id || seq < 0) { ++incompleteBusCount; continue; }
+    if (seq > targetSeq[direction]) continue;
     if (initial) {
       if (count >= 24) { stream.close(); setError("Too many vehicles", Screen::ROUTES); return true; }
       copyText(vehicles[count].id, id, sizeof(vehicles[count].id));
@@ -299,7 +319,18 @@ bool loadVehicles(bool initial) {
   }
   stream.close();
   if (result != 0) return false;
-  if (initial) { vehicleCount = count; menuIndex = 0; vehicleListLoaded = true; }
+  if (initial) {
+    vehicleCount = count; menuIndex = 0; vehicleListLoaded = true;
+    if (count) vehicleListStatus = VehicleListStatus::HAS_APPROACHING_BUSES;
+    else if (!routeBusCount) vehicleListStatus = VehicleListStatus::NO_ROUTE_BUSES;
+    else if (!directionBusCount) vehicleListStatus = VehicleListStatus::NO_DIRECTION_BUSES;
+    else if (incompleteBusCount) vehicleListStatus = VehicleListStatus::INCOMPLETE_DATA;
+    else vehicleListStatus = VehicleListStatus::NO_APPROACHING_BUSES;
+    Serial.print(F("Route buses=")); Serial.print(routeBusCount);
+    Serial.print(F(" direction=")); Serial.print(directionBusCount);
+    Serial.print(F(" approaching=")); Serial.print(count);
+    Serial.print(F(" incomplete=")); Serial.println(incompleteBusCount);
+  }
   else {
     vehiclePresent = foundSelected;
     if (foundSelected) { selectedSeq = newSeq; posGoodMs = millis(); }
@@ -400,9 +431,10 @@ void drawScreen() {
     oled.drawStr(0, 10, "Daegu Bus Tracker"); oled.drawHLine(0, 13, 128);
     switch (screen) {
       case Screen::WIFI: oled.drawStr(0, 30, "Wi-Fi connecting"); break;
-      case Screen::GPS:
-        oled.drawStr(0, 30, "Waiting for GPS");
-        oled.setCursor(0, 47); oled.print("Samples "); oled.print(gpsCount); oled.print("/5"); break;
+      case Screen::SOURCE:
+        oled.drawStr(0, 27, "D2: Hwawon school");
+        oled.drawStr(0, 42, "No press: use GPS");
+        oled.setCursor(0, 58); oled.print("GPS "); oled.print(gpsCount); oled.print("/5"); break;
       case Screen::FIND_STOP: oled.drawStr(0, 30, "Finding nearest stop"); break;
       case Screen::ROUTES:
         oled.setCursor(0, 26); oled.print("STOP ");
@@ -414,13 +446,29 @@ void drawScreen() {
           oled.setCursor(0, 51); oled.print("> "); oled.print(label);
           oled.setCursor(0, 60); oled.print(menuIndex + 1); oled.print("/"); oled.print(routeCount);
         } break;
+      case Screen::VARIANTS:
+        oled.drawStr(0, 27, "Choose route variant");
+        if (variantCount) {
+          uint16_t r = variantChoices[menuIndex];
+          oled.setCursor(0, 43); oled.print(ROUTE_NUMBERS[r]);
+          oled.print(" "); oled.print(menuIndex + 1); oled.print("/"); oled.print(variantCount);
+          oled.setCursor(0, 59); oled.print("ID "); oled.print(ROUTE_IDS[r]);
+        } break;
       case Screen::DIRECTIONS:
         oled.drawStr(0, 28, "Select direction");
         oled.setCursor(0, 48); oled.print("> "); oled.print(menuIndex == 0 ? "Forward" : "Reverse"); break;
       case Screen::VEHICLES:
         oled.drawStr(0, 27, "Select bus (A0/D2)");
         if (vehicleCount) { oled.setCursor(0, 45); oled.print("> "); oled.print(vehicles[menuIndex].id); }
-        else oled.drawStr(0, 47, "No active buses"); break;
+        else {
+          const char* message = "Bus status unknown";
+          if (vehicleListStatus == VehicleListStatus::NO_ROUTE_BUSES) message = "No buses on route";
+          else if (vehicleListStatus == VehicleListStatus::NO_DIRECTION_BUSES) message = "No buses this way";
+          else if (vehicleListStatus == VehicleListStatus::NO_APPROACHING_BUSES) message = "No buses approaching";
+          else if (vehicleListStatus == VehicleListStatus::INCOMPLETE_DATA) message = "Bus data incomplete";
+          oled.drawStr(0, 47, message);
+          oled.drawStr(0, 61, "D2 retry / hold back");
+        } break;
       case Screen::ERROR:
         oled.drawStr(0, 30, errorText);
         oled.drawStr(0, 47, "Retrying shortly"); break;
@@ -430,12 +478,36 @@ void drawScreen() {
   oled.sendBuffer();
 }
 
-void shortPress() {
-  if (screen == Screen::ROUTES && routeCount) {
-    chosenRoute = routeChoices[menuIndex];
+void chooseRouteVariant(uint16_t selectedRoute) {
+    chosenRoute = selectedRoute;
     copyText(routeId, ROUTE_IDS[chosenRoute], sizeof(routeId));
     copyText(routeNo, ROUTE_NUMBERS[chosenRoute], sizeof(routeNo));
     if (!loadDirections()) setError("Route stops failed", Screen::ROUTES);
+}
+
+void shortPress() {
+  if (screen == Screen::SOURCE) {
+    latitude = HWAWON_LAT;
+    longitude = HWAWON_LON;
+    gpsReady = true;
+    screen = Screen::FIND_STOP;
+  } else if (screen == Screen::ROUTES && routeCount) {
+    const char* selectedNumber = ROUTE_NUMBERS[routeChoices[menuIndex]];
+    variantCount = 0;
+    for (uint16_t r = 0; r < ROUTE_COUNT; ++r) {
+      if (strcmp(ROUTE_NUMBERS[r], selectedNumber) != 0) continue;
+      for (uint16_t n = ROUTE_OFFSETS[r]; n < ROUTE_OFFSETS[r + 1]; ++n) {
+        if (ROUTE_STOPS[n] != stopIndex) continue;
+        if (variantCount >= 32) { setError("Too many variants", Screen::ROUTES); return; }
+        variantChoices[variantCount++] = r;
+        break;
+      }
+    }
+    if (variantCount == 1) chooseRouteVariant(variantChoices[0]);
+    else if (variantCount > 1) { menuIndex = 0; screen = Screen::VARIANTS; }
+    else setError("Route map mismatch", Screen::ROUTES);
+  } else if (screen == Screen::VARIANTS && variantCount) {
+    chooseRouteVariant(variantChoices[menuIndex]);
   } else if (screen == Screen::DIRECTIONS) {
     direction = menuIndex; screen = Screen::VEHICLES; vehicleListLoaded = false;
     if (!loadVehicles(true)) setError("Bus list failed", Screen::DIRECTIONS);
@@ -447,12 +519,20 @@ void shortPress() {
     etaAvailable = false; etaSeconds = -1; buzzerPlayed = false;
     screen = Screen::TRACK;
     if (!loadEta()) Serial.println(F("ETA lookup failed; tracking position only."));
+  } else if (screen == Screen::VEHICLES) {
+    if (!loadVehicles(true)) setError("Bus list failed", Screen::VEHICLES);
   }
 }
 
 void longPress() {
   if (screen == Screen::TRACK) { screen = Screen::VEHICLES; etaAvailable = false; }
-  else if (screen == Screen::VEHICLES || screen == Screen::DIRECTIONS) screen = Screen::ROUTES;
+  else if (screen == Screen::VEHICLES || screen == Screen::DIRECTIONS || screen == Screen::VARIANTS)
+    screen = Screen::ROUTES;
+  else if (screen == Screen::ROUTES) {
+    gpsReady = false;
+    gpsCount = 0;
+    screen = Screen::SOURCE;
+  }
 }
 
 void updateButton(uint32_t now) {
@@ -470,7 +550,7 @@ void updateButton(uint32_t now) {
 
 void updateGps(uint32_t now) {
   while (Serial1.available()) gps.encode(Serial1.read());
-  if (screen != Screen::GPS || !gps.location.isUpdated() || !gps.location.isValid() ||
+  if (screen != Screen::SOURCE || !gps.location.isUpdated() || !gps.location.isValid() ||
       gps.location.age() > 3000) return;
   if (gpsSampleMs && (uint32_t)(now - gpsSampleMs) < 1000) return;
   gpsSampleMs = now ? now : 1;
@@ -515,6 +595,7 @@ void trackerLoop() {
   updateButton(now);
   knob = (uint32_t(knob) * 7 + analogRead(PIN_ROTATION)) / 8;
   if (screen == Screen::ROUTES) menuIndex = choiceFromKnob(routeCount);
+  if (screen == Screen::VARIANTS) menuIndex = choiceFromKnob(variantCount);
   if (screen == Screen::DIRECTIONS) menuIndex = choiceFromKnob(2);
   if (screen == Screen::VEHICLES) menuIndex = choiceFromKnob(vehicleCount);
   updateWifi(now);
